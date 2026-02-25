@@ -43,7 +43,7 @@ add_action('plugins_loaded', function () {
 
     MMBPL_Sync::handle_booking_created($booking_id, $args);
   }, 10, 3);
-
+    MMBPL_Logger::log('HOOK bookingpress_after_book_appointment fired. booking_id=' . $booking_id);
   // Booking updated (optional but useful)
   add_action('bookingpress_after_update_appointment', function () {
     $args = func_get_args();
