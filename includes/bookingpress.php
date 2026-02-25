@@ -132,11 +132,19 @@ class MMBPL_BookingPress {
     if (!$bcols) return false;
     $bset = array_flip($bcols);
 
-    // Determine PK column
-    $pk = null;
-    foreach (['id','booking_id','appointment_id'] as $c) {
-      if (isset($bset[$c])) { $pk = $c; break; }
-    }
+    // Determine PK column (BookingPress Pro uses bookingpress_appointment_booking_id)
+$pk = null;
+foreach ([
+  'bookingpress_appointment_booking_id',
+  'bookingpress_booking_id',
+  'bookingpress_entry_id',
+  'bookingpress_order_id',
+  'id',
+  'booking_id',
+  'appointment_id'
+] as $c) {
+  if (isset($bset[$c])) { $pk = $c; break; }
+}
     if (!$pk) {
       if ($debug) MMBPL_Logger::log("No primary id column found on {$bt}. cols=" . implode(',', $bcols));
       return false;
@@ -148,91 +156,34 @@ class MMBPL_BookingPress {
       return false;
     }
 
-    // Find customer_id and service_id fields
-    $customer_id = null;
-    foreach (['customer_id','bookingpress_customer_id'] as $c) {
-      if (isset($booking[$c]) && $booking[$c]) { $customer_id = (int) $booking[$c]; break; }
-    }
+    
+    // Appointment date/time fields (your table has these)
+$appointment_date = $booking['bookingpress_appointment_date'] ?? ($booking['appointment_date'] ?? '');
+$appointment_time = $booking['bookingpress_appointment_time'] ?? ($booking['appointment_time'] ?? '');
 
-    $service_id = null;
-    foreach (['service_id','bookingpress_service_id'] as $c) {
-      if (isset($booking[$c]) && $booking[$c]) { $service_id = (int) $booking[$c]; break; }
-    }
+// Service name is in the booking row on your install
+$service_name = $booking['bookingpress_service_name'] ?? ($booking['service_name'] ?? '');
 
-    $customer = [];
-    $service  = [];
+// Customer fields are also in the booking row on your install
+$out = [
+  'appointment_date'     => (string) $appointment_date,
+  'appointment_time'     => (string) $appointment_time,
+  'service_name'         => (string) $service_name,
+  'customer_first_name'  => (string) ($booking['bookingpress_customer_firstname'] ?? ($booking['customer_first_name'] ?? '')),
+  'customer_last_name'   => (string) ($booking['bookingpress_customer_lastname'] ?? ($booking['customer_last_name'] ?? '')),
+  'customer_email'       => (string) ($booking['bookingpress_customer_email'] ?? ($booking['customer_email'] ?? '')),
+  'customer_phone'       => (string) ($booking['bookingpress_customer_phone'] ?? ($booking['customer_phone'] ?? '')),
+  'customer_note'        => (string) ($booking['bookingpress_customer_note'] ?? ($booking['customer_note'] ?? '')),
+];
 
-    if (!empty($tables['customer_table']) && $customer_id) {
-      $ct = $tables['customer_table'];
-      $ccols = $wpdb->get_col("SHOW COLUMNS FROM {$ct}", 0);
-      $cset = array_flip($ccols);
+if ($debug) {
+  MMBPL_Logger::log('Detected tables: ' . print_r($tables, true));
+  MMBPL_Logger::log('Booking PK column: ' . $pk);
+  MMBPL_Logger::log('Booking row keys: ' . implode(',', array_keys($booking)));
+  MMBPL_Logger::log('Normalized payload: ' . print_r($out, true));
+}
 
-      $cpk = null;
-      foreach (['id','customer_id'] as $c) {
-        if (isset($cset[$c])) { $cpk = $c; break; }
-      }
-      if ($cpk) {
-        $customer = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$ct} WHERE {$cpk}=%d", $customer_id), ARRAY_A) ?: [];
-      }
-    }
-
-    if (!empty($tables['service_table']) && $service_id) {
-      $st = $tables['service_table'];
-      $scols = $wpdb->get_col("SHOW COLUMNS FROM {$st}", 0);
-      $sset = array_flip($scols);
-
-      $spk = null;
-      foreach (['id','service_id'] as $c) {
-        if (isset($sset[$c])) { $spk = $c; break; }
-      }
-      if ($spk) {
-        $service = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$st} WHERE {$spk}=%d", $service_id), ARRAY_A) ?: [];
-      }
-    }
-
-    // Appointment date/time fields, try common names
-    $appointment_date = '';
-    foreach (['appointment_date','bookingpress_appointment_date','start_date','appointment_start_date'] as $c) {
-      if (!empty($booking[$c])) { $appointment_date = $booking[$c]; break; }
-    }
-
-    $appointment_time = '';
-    foreach (['appointment_time','bookingpress_appointment_time','start_time','appointment_start_time'] as $c) {
-      if (!empty($booking[$c])) { $appointment_time = $booking[$c]; break; }
-    }
-
-    $service_name = '';
-    foreach (['service_name','name','title'] as $c) {
-      if (!empty($service[$c])) { $service_name = $service[$c]; break; }
-    }
-
-    $out = [
-      'appointment_date' => $appointment_date,
-      'appointment_time' => $appointment_time,
-      'service_name'     => $service_name,
-    ];
-
-    // Customer fields, try common names
-    foreach ([
-      'customer_first_name' => ['customer_first_name','first_name'],
-      'customer_last_name'  => ['customer_last_name','last_name'],
-      'customer_email'      => ['customer_email','email'],
-      'customer_phone'      => ['customer_phone','phone','mobile'],
-      'customer_note'       => ['customer_note','note','notes'],
-    ] as $key => $candidates) {
-      foreach ($candidates as $c) {
-        if (!empty($customer[$c])) { $out[$key] = $customer[$c]; break; }
-      }
-      if (!isset($out[$key])) $out[$key] = '';
-    }
-
-    if ($debug) {
-      MMBPL_Logger::log('Detected tables: ' . print_r($tables, true));
-      MMBPL_Logger::log('Booking row keys: ' . implode(',', array_keys($booking)));
-      if ($customer) MMBPL_Logger::log('Customer row keys: ' . implode(',', array_keys($customer)));
-      if ($service) MMBPL_Logger::log('Service row keys: ' . implode(',', array_keys($service)));
-    }
-
-    return $out;
+return $out;
+    
   }
 }
