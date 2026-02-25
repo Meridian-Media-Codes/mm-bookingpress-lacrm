@@ -21,6 +21,7 @@ require_once MMBPL_PLUGIN_DIR . 'includes/admin.php';
 
 register_activation_hook(__FILE__, function () {
   MMBPL_Map::install();
+
   if (!get_option(MMBPL_OPT)) {
     add_option(MMBPL_OPT, [
       'lacrm_api_key' => '',
@@ -34,20 +35,25 @@ register_activation_hook(__FILE__, function () {
 });
 
 add_action('plugins_loaded', function () {
+
   // Booking created
   add_action('bookingpress_after_book_appointment', function ($inserted_booking_id = 0) {
     $args = func_get_args();
     $booking_id = MMBPL_BookingPress::extract_booking_id($args);
 
+    // Always log this so we can confirm hook firing
+    MMBPL_Logger::log('HOOK bookingpress_after_book_appointment fired. booking_id=' . (int) $booking_id);
+
     if (!$booking_id) return;
 
     MMBPL_Sync::handle_booking_created($booking_id, $args);
   }, 10, 3);
-    MMBPL_Logger::log('HOOK bookingpress_after_book_appointment fired. booking_id=' . $booking_id);
-  // Booking updated (optional but useful)
+
+  // Booking updated
   add_action('bookingpress_after_update_appointment', function () {
     $args = func_get_args();
     $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+
     if (!$booking_id) return;
 
     MMBPL_Sync::handle_booking_updated($booking_id, $args);
@@ -57,6 +63,7 @@ add_action('plugins_loaded', function () {
   add_action('bookingpress_after_cancel_appointment', function () {
     $args = func_get_args();
     $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+
     if (!$booking_id) return;
 
     MMBPL_Sync::handle_booking_cancelled($booking_id, $args);
@@ -67,6 +74,7 @@ class MMBPL_Sync {
 
   public static function handle_booking_created($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
+
     if (empty($settings['lacrm_api_key'])) {
       MMBPL_Logger::log('No LACRM API key set. Skipping.');
       return;
@@ -75,18 +83,18 @@ class MMBPL_Sync {
     $bp = MMBPL_BookingPress::get_booking_payload($booking_id);
 
     if (!$bp || empty($bp['customer_email'])) {
-      MMBPL_Logger::log('No payload or missing customer_email for booking_id=' . $booking_id);
+      MMBPL_Logger::log('No payload or missing customer_email for booking_id=' . (int) $booking_id);
       return;
     }
 
     if (!empty($settings['debug'])) {
-      MMBPL_Logger::log('CREATE booking_id=' . $booking_id . ' payload=' . print_r($bp, true));
+      MMBPL_Logger::log('CREATE booking_id=' . (int) $booking_id . ' payload=' . print_r($bp, true));
     }
 
     $contact_id = MMBPL_LACRM::upsert_contact_by_email($bp);
 
     if (!$contact_id) {
-      MMBPL_Logger::log('Failed to upsert contact for booking_id=' . $booking_id);
+      MMBPL_Logger::log('Failed to upsert contact for booking_id=' . (int) $booking_id);
       return;
     }
 
@@ -102,13 +110,19 @@ class MMBPL_Sync {
 
     if ($event_id) {
       MMBPL_Map::set_event_id((int) $booking_id, (string) $event_id);
+    } else {
+      MMBPL_Logger::log('CreateEvent failed for booking_id=' . (int) $booking_id);
     }
 
     if (!empty($settings['add_note'])) {
-      MMBPL_LACRM::create_note([
+      $ok = MMBPL_LACRM::create_note([
         'ContactId' => $contact_id,
         'Note'      => self::build_summary($bp),
       ]);
+
+      if (!$ok) {
+        MMBPL_Logger::log('CreateNote failed for booking_id=' . (int) $booking_id);
+      }
     }
   }
 
@@ -117,23 +131,19 @@ class MMBPL_Sync {
     if (empty($settings['lacrm_api_key'])) return;
 
     $bp = MMBPL_BookingPress::get_booking_payload($booking_id);
-
     if (!$bp || empty($bp['customer_email'])) return;
 
     if (!empty($settings['debug'])) {
-      MMBPL_Logger::log('UPDATE booking_id=' . $booking_id . ' payload=' . print_r($bp, true));
+      MMBPL_Logger::log('UPDATE booking_id=' . (int) $booking_id . ' payload=' . print_r($bp, true));
     }
 
     $contact_id = MMBPL_LACRM::upsert_contact_by_email($bp);
     if (!$contact_id) return;
 
     $existing_event_id = MMBPL_Map::get_event_id((int) $booking_id);
-
     $title = self::render_template($settings['event_title_template'] ?? '{service} booking', $bp);
 
     if ($existing_event_id) {
-      // LACRM does not have a clean "EditEvent" in the basic flow most people use,
-      // so safest behavior is delete and recreate.
       MMBPL_LACRM::delete_event($existing_event_id);
 
       $new_event_id = MMBPL_LACRM::create_event([
@@ -146,9 +156,10 @@ class MMBPL_Sync {
 
       if ($new_event_id) {
         MMBPL_Map::set_event_id((int) $booking_id, (string) $new_event_id);
+      } else {
+        MMBPL_Logger::log('Recreate event failed for booking_id=' . (int) $booking_id);
       }
     } else {
-      // No mapping yet, treat as create
       self::handle_booking_created($booking_id, $hook_args);
     }
   }
@@ -156,13 +167,12 @@ class MMBPL_Sync {
   public static function handle_booking_cancelled($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
     if (empty($settings['lacrm_api_key'])) return;
-
     if (empty($settings['delete_on_cancel'])) return;
 
     $event_id = MMBPL_Map::get_event_id((int) $booking_id);
 
     if (!empty($settings['debug'])) {
-      MMBPL_Logger::log('CANCEL booking_id=' . $booking_id . ' event_id=' . ($event_id ?: 'none'));
+      MMBPL_Logger::log('CANCEL booking_id=' . (int) $booking_id . ' event_id=' . ($event_id ?: 'none'));
     }
 
     if (!$event_id) return;
@@ -171,6 +181,8 @@ class MMBPL_Sync {
 
     if ($ok) {
       MMBPL_Map::delete_mapping((int) $booking_id);
+    } else {
+      MMBPL_Logger::log('DeleteEvent failed for booking_id=' . (int) $booking_id . ' event_id=' . $event_id);
     }
   }
 
