@@ -65,17 +65,35 @@ add_action('plugins_loaded', function () {
 
   // Cancelled
   add_action('bookingpress_after_cancel_appointment', function () {
-    $args = func_get_args();
-    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+  $args = func_get_args();
 
-    MMBPL_Logger::log('HOOK bookingpress_after_cancel_appointment fired. booking_id=' . (int) $booking_id);
+  MMBPL_Logger::log('HOOK bookingpress_after_cancel_appointment fired. raw_args=' . print_r($args, true));
 
-    if ($booking_id) {
-      MMBPL_Sync::handle_booking_cancelled((int) $booking_id, $args);
+  $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+
+  // Fallback: sometimes BookingPress sends the id via POST/REQUEST
+  if (!$booking_id) {
+    $candidates = [
+      $_POST['bookingpress_appointment_booking_id'] ?? null,
+      $_POST['appointment_booking_id'] ?? null,
+      $_REQUEST['bookingpress_appointment_booking_id'] ?? null,
+      $_REQUEST['appointment_booking_id'] ?? null,
+      $_POST['booking_id'] ?? null,
+      $_REQUEST['booking_id'] ?? null,
+    ];
+    foreach ($candidates as $c) {
+      if (is_numeric($c) && (int) $c > 0) { $booking_id = (int) $c; break; }
     }
-  }, 10, 10);
+  }
 
-});
+  MMBPL_Logger::log('HOOK bookingpress_after_cancel_appointment parsed booking_id=' . (int) $booking_id);
+
+  if ($booking_id) {
+    MMBPL_Sync::handle_booking_cancelled((int) $booking_id, $args);
+  } else {
+    MMBPL_Logger::log('Cancel hook fired but booking_id could not be determined.');
+  }
+}, 10, 99);
 
 class MMBPL_Sync {
 
@@ -293,13 +311,24 @@ class MMBPL_Sync {
   }
 
   public static function is_cancelled_status($status) {
-    $s = strtolower(trim((string) $status));
-    if ($s === '') return false;
+  $raw = trim((string) $status);
+  if ($raw === '') return false;
 
-    return in_array($s, [
-      'cancelled','canceled','cancel','cancelled_by_admin','cancelled_by_customer','rejected'
-    ], true);
+  // Numeric statuses used by some BookingPress installs
+  if (ctype_digit($raw)) {
+    $code = (int) $raw;
+
+    // These are common patterns:
+    // 1 often means approved or pending on some setups
+    // Cancelled is commonly 3 or 4 depending on configuration
+    return in_array($code, [3, 4], true);
   }
+
+  $s = strtolower($raw);
+  return in_array($s, [
+    'cancelled','canceled','cancel','cancelled_by_admin','cancelled_by_customer','rejected'
+  ], true);
+}
 
   public static function booking_hash($bp) {
     $parts = [
