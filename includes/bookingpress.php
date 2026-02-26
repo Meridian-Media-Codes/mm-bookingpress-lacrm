@@ -31,7 +31,7 @@ class MMBPL_BookingPress {
 
     if (!$row) return false;
 
-    $payload = [
+        $payload = [
       'customer_first_name' => $row['customer_first_name'] ?? '',
       'customer_last_name'  => $row['customer_last_name'] ?? '',
       'customer_email'      => $row['customer_email'] ?? '',
@@ -42,6 +42,14 @@ class MMBPL_BookingPress {
       'appointment_time'    => $row['appointment_time'] ?? '',
       'status'              => $row['status'] ?? '',
       'internal_note'       => $row['internal_note'] ?? '',
+
+      // Address
+      'customer_address_1'  => $row['customer_address_1'] ?? '',
+      'customer_address_2'  => $row['customer_address_2'] ?? '',
+      'customer_city'       => $row['customer_city'] ?? '',
+      'customer_state'      => $row['customer_state'] ?? '',
+      'customer_postcode'   => $row['customer_postcode'] ?? '',
+      'customer_country'    => $row['customer_country'] ?? '',
     ];
 
     return $payload;
@@ -202,6 +210,15 @@ class MMBPL_BookingPress {
       'customer_note'        => (string) ($booking['bookingpress_customer_note'] ?? ($booking['customer_note'] ?? '')),
       'status'               => (string) ($booking['bookingpress_appointment_status'] ?? ($booking['appointment_status'] ?? '')),
       'internal_note'        => (string) ($booking['bookingpress_appointment_internal_note'] ?? ($booking['appointment_internal_note'] ?? '')),
+
+      // Address fields (these keys depend on your BookingPress table, so we check common variants)
+      'customer_address_1'   => (string) ($booking['bookingpress_customer_address'] ?? ($booking['customer_address'] ?? ($booking['address'] ?? ''))),
+      'customer_address_2'   => (string) ($booking['bookingpress_customer_address_2'] ?? ($booking['customer_address_2'] ?? '')),
+      'customer_city'        => (string) ($booking['bookingpress_customer_city'] ?? ($booking['customer_city'] ?? ($booking['city'] ?? ''))),
+      'customer_state'       => (string) ($booking['bookingpress_customer_state'] ?? ($booking['customer_state'] ?? ($booking['state'] ?? ''))),
+      'customer_postcode'    => (string) ($booking['bookingpress_customer_postcode'] ?? ($booking['customer_postcode'] ?? ($booking['postcode'] ?? ($booking['zip'] ?? '')))),
+      'customer_country'     => (string) ($booking['bookingpress_customer_country'] ?? ($booking['customer_country'] ?? ($booking['country'] ?? ''))),
+    
     ];
 
     if ($debug) {

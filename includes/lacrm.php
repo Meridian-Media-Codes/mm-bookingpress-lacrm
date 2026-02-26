@@ -135,9 +135,23 @@ class MMBPL_LACRM {
       (string) ($bp['customer_first_name'] ?? '') . ' ' . (string) ($bp['customer_last_name'] ?? '')
     );
 
+        $street_parts = array_filter([
+      trim((string) ($bp['customer_address_1'] ?? '')),
+      trim((string) ($bp['customer_address_2'] ?? '')),
+    ]);
+
+    $street = implode("\n", $street_parts);
+
+    $city    = trim((string) ($bp['customer_city'] ?? ''));
+    $state   = trim((string) ($bp['customer_state'] ?? ''));
+    $zip     = trim((string) ($bp['customer_postcode'] ?? ''));
+    $country = trim((string) ($bp['customer_country'] ?? ''));
+
+    $has_address = ($street !== '' || $city !== '' || $state !== '' || $zip !== '' || $country !== '');
+
     $phone = trim((string) ($bp['customer_phone'] ?? ''));
 
-    if ($contact_id) {
+        if ($contact_id) {
       $edit_params = [
         'ContactId' => $contact_id,
       ];
@@ -156,8 +170,24 @@ class MMBPL_LACRM {
         ];
       }
 
+      if ($has_address) {
+        $edit_params['Address'] = [
+          [
+            'Street'  => $street,
+            'City'    => $city,
+            'State'   => $state,
+            'Zip'     => $zip,
+            'Country' => $country,
+            'Type'    => 'Work',
+          ]
+        ];
+      }
+
       $ok = self::call_api('EditContact', $edit_params);
       if ($ok === false) return false;
+
+      return $contact_id;
+    }
 
       return $contact_id;
     }
@@ -176,6 +206,16 @@ class MMBPL_LACRM {
         ['Email' => $email, 'Type' => 'Work']
       ],
       'Phone'       => ($phone ? [['Phone' => $phone, 'Type' => 'Work']] : []),
+            'Address'     => ($has_address ? [
+        [
+          'Street'  => $street,
+          'City'    => $city,
+          'State'   => $state,
+          'Zip'     => $zip,
+          'Country' => $country,
+          'Type'    => 'Work',
+        ]
+      ] : []),
     ]);
 
     if (!$create || empty($create['ContactId'])) {

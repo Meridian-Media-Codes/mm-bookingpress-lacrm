@@ -89,32 +89,33 @@ add_action('plugins_loaded', function () {
     }
   }, 10, 10);
 
+  // Status changed (reliable for admin changes)
   add_action('bookingpress_after_change_appointment_status', function ($appointment_id = null, $new_status = null) {
 
-  $settings = get_option(MMBPL_OPT, []);
-  $debug = !empty($settings['debug']);
+    $settings = get_option(MMBPL_OPT, []);
+    $debug = !empty($settings['debug']);
 
-  $raw_id = is_numeric($appointment_id) ? (int) $appointment_id : 0;
-  $booking_id = MMBPL_BookingPress::resolve_booking_id($raw_id);
+    $raw_id = is_numeric($appointment_id) ? (int) $appointment_id : 0;
+    $booking_id = MMBPL_BookingPress::resolve_booking_id($raw_id);
 
-  if ($debug) {
-    MMBPL_Logger::log(
-      'HOOK bookingpress_after_change_appointment_status fired. raw_id=' . (int) $raw_id .
-      ' resolved_booking_id=' . (int) $booking_id .
-      ' new_status=' . (string) $new_status
-    );
-  }
+    if ($debug) {
+      MMBPL_Logger::log(
+        'HOOK bookingpress_after_change_appointment_status fired. raw_id=' . (int) $raw_id .
+        ' resolved_booking_id=' . (int) $booking_id .
+        ' new_status=' . (string) $new_status
+      );
+    }
 
-  if (!$booking_id) return;
+    if (!$booking_id) return;
 
-  if (MMBPL_Sync::is_cancelled_status($new_status)) {
-    MMBPL_Sync::handle_booking_cancelled((int) $booking_id, [$appointment_id, $new_status]);
-    return;
-  }
+    if (MMBPL_Sync::is_cancelled_status($new_status)) {
+      MMBPL_Sync::handle_booking_cancelled((int) $booking_id, [$appointment_id, $new_status]);
+      return;
+    }
 
-  MMBPL_Sync::handle_booking_updated((int) $booking_id, [$appointment_id, $new_status]);
+    MMBPL_Sync::handle_booking_updated((int) $booking_id, [$appointment_id, $new_status]);
 
-}, 10, 2);
+  }, 10, 2);
 
   // Cancelled (may not fire on all installs, keep for coverage)
   add_action('bookingpress_after_cancel_appointment', function () {
@@ -224,6 +225,19 @@ class MMBPL_Sync {
     delete_transient('mmbpl_lock_' . (int) $booking_id);
   }
 
+  private static function event_location_from_bp($bp) {
+    $parts = array_filter([
+      trim((string) ($bp['customer_address_1'] ?? '')),
+      trim((string) ($bp['customer_address_2'] ?? '')),
+      trim((string) ($bp['customer_city'] ?? '')),
+      trim((string) ($bp['customer_state'] ?? '')),
+      trim((string) ($bp['customer_postcode'] ?? '')),
+      trim((string) ($bp['customer_country'] ?? '')),
+    ]);
+
+    return implode(', ', $parts);
+  }
+
   public static function handle_booking_created($booking_id, $hook_args = []) {
     $booking_id = (int) $booking_id;
 
@@ -276,7 +290,7 @@ class MMBPL_Sync {
         'StartDate'   => $start,
         'EndDate'     => $end,
         'Description' => self::build_summary($bp),
-        'Location'    => '',
+        'Location'    => self::event_location_from_bp($bp),
         'IsAllDay'    => false,
       ]);
 
@@ -339,7 +353,7 @@ class MMBPL_Sync {
         'StartDate'   => $start,
         'EndDate'     => $end,
         'Description' => self::build_summary($bp),
-        'Location'    => '',
+        'Location'    => self::event_location_from_bp($bp),
         'IsAllDay'    => false,
       ]);
 
@@ -366,17 +380,12 @@ class MMBPL_Sync {
 
       $event_id = MMBPL_Map::get_event_id($booking_id);
 
-      // Always log cancellation actions that have a mapping, even if debug is off
-      if ($event_id) {
-        MMBPL_Logger::log('Cancel: processing booking_id=' . $booking_id . ' event_id=' . $event_id);
+      if (!$event_id) {
+        MMBPL_Logger::log('Cancel: no mapping found for booking_id=' . $booking_id . ' (nothing to delete)');
+        return;
       }
 
-      if (!$event_id) {
-  MMBPL_Logger::log('Cancel: no mapping found for booking_id=' . $booking_id . ' (nothing to delete)');
-  return;
-}
-
-      if (!$event_id) return;
+      MMBPL_Logger::log('Cancel: processing booking_id=' . $booking_id . ' event_id=' . $event_id);
 
       $ok = MMBPL_LACRM::delete_event((string) $event_id);
 
@@ -386,7 +395,6 @@ class MMBPL_Sync {
         return;
       }
 
-      // If delete failed, do not remove mapping
       MMBPL_Logger::log('Cancel: delete failed booking_id=' . $booking_id . ' event_id=' . $event_id);
 
     } finally {
@@ -416,6 +424,12 @@ class MMBPL_Sync {
       (string) ($bp['status'] ?? ''),
       (string) ($bp['customer_note'] ?? ''),
       (string) ($bp['internal_note'] ?? ''),
+      (string) ($bp['customer_address_1'] ?? ''),
+      (string) ($bp['customer_address_2'] ?? ''),
+      (string) ($bp['customer_city'] ?? ''),
+      (string) ($bp['customer_state'] ?? ''),
+      (string) ($bp['customer_postcode'] ?? ''),
+      (string) ($bp['customer_country'] ?? ''),
     ];
     return hash('sha256', implode('|', $parts));
   }
@@ -447,6 +461,21 @@ class MMBPL_Sync {
 
     if (!empty($bp['customer_email'])) $lines[] = 'Email: ' . $bp['customer_email'];
     if (!empty($bp['customer_phone'])) $lines[] = 'Phone: ' . $bp['customer_phone'];
+
+    $addr_lines = array_filter([
+      trim((string) ($bp['customer_address_1'] ?? '')),
+      trim((string) ($bp['customer_address_2'] ?? '')),
+      trim((string) ($bp['customer_city'] ?? '')),
+      trim((string) ($bp['customer_state'] ?? '')),
+      trim((string) ($bp['customer_postcode'] ?? '')),
+      trim((string) ($bp['customer_country'] ?? '')),
+    ]);
+
+    if (!empty($addr_lines)) {
+      $lines[] = '';
+      $lines[] = 'Address:';
+      foreach ($addr_lines as $l) $lines[] = $l;
+    }
 
     if (!empty($bp['customer_note'])) {
       $lines[] = '';
