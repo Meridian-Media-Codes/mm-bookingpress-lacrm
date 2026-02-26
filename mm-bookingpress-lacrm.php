@@ -19,8 +19,9 @@ require_once MMBPL_PLUGIN_DIR . 'includes/lacrm.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/bookingpress.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/admin.php';
 
-MMBPL_Logger::log('Plugin loaded');
-
+/**
+ * Activation: create mapping table + default settings.
+ */
 register_activation_hook(__FILE__, function () {
   MMBPL_Map::install();
 
@@ -36,15 +37,64 @@ register_activation_hook(__FILE__, function () {
   }
 });
 
+MMBPL_Logger::log('Plugin loaded');
+
 /**
- * Trigger sync on actual DB insert into BookingPress bookings table.
- * This avoids relying on BookingPress hook argument formats.
+ * Polling fallback (works even if BookingPress hooks and wpdb hooks are unreliable).
+ * Runs on normal WP requests. After a booking is created, refresh any page once to trigger sync.
+ */
+add_action('init', function () {
+
+  global $wpdb;
+
+  // Find the actual BookingPress bookings table name (prefix can vary)
+  $table = $wpdb->get_var("SHOW TABLES LIKE '%bookingpress_appointment_bookings%'");
+
+  if (empty($table)) {
+    MMBPL_Logger::log('Polling: bookings table not found.');
+    return;
+  }
+
+  $last_processed = (int) get_option('mmbpl_last_processed_id', 0);
+
+  $latest_id = (int) $wpdb->get_var("SELECT MAX(bookingpress_appointment_booking_id) FROM {$table}");
+
+  if (!$latest_id || $latest_id <= $last_processed) {
+    return;
+  }
+
+  $new_ids = $wpdb->get_col(
+    $wpdb->prepare(
+      "SELECT bookingpress_appointment_booking_id
+       FROM {$table}
+       WHERE bookingpress_appointment_booking_id > %d
+       ORDER BY bookingpress_appointment_booking_id ASC",
+      $last_processed
+    )
+  );
+
+  if (empty($new_ids)) {
+    return;
+  }
+
+  foreach ($new_ids as $booking_id) {
+
+    MMBPL_Logger::log('Polling detected new booking ID ' . (int) $booking_id);
+
+    MMBPL_Sync::handle_booking_created((int) $booking_id);
+
+    update_option('mmbpl_last_processed_id', (int) $booking_id);
+  }
+
+});
+
+/**
+ * Optional: DB insert trigger (may not fire on some setups; polling above is the reliable fallback).
  */
 add_action('wpdb_insert', function ($table, $data) {
 
   global $wpdb;
 
-  // Only act on BookingPress bookings table, and only on the main booking insert
   if (
     strpos($table, 'bookingpress_appointment_bookings') === false ||
     empty($data['bookingpress_appointment_booking_id'])
@@ -61,7 +111,6 @@ add_action('wpdb_insert', function ($table, $data) {
 
   MMBPL_Logger::log('DB INSERT detected. booking_id=' . $booking_id);
 
-  // Create sync on booking creation
   MMBPL_Sync::handle_booking_created($booking_id);
 
 }, 10, 2);
@@ -122,7 +171,7 @@ class MMBPL_Sync {
     }
   }
 
-  // These remain for later use if we add update/cancel detection via DB updates:
+  // Available for later if we implement update/cancel detection
   public static function handle_booking_updated($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
     if (empty($settings['lacrm_api_key'])) return;
