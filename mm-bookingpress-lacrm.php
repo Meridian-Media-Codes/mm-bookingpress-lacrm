@@ -34,41 +34,35 @@ register_activation_hook(__FILE__, function () {
   }
 });
 
-add_action('plugins_loaded', function () {
+/**
+ * Trigger sync on actual DB insert into BookingPress bookings table.
+ * This avoids relying on BookingPress hook argument formats.
+ */
+add_action('wpdb_insert', function ($table, $data) {
 
-  // Booking created
-  add_action('bookingpress_after_book_appointment', function ($inserted_booking_id = 0) {
-    $args = func_get_args();
-    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+  global $wpdb;
 
-    // Always log this so we can confirm hook firing
-    MMBPL_Logger::log('HOOK bookingpress_after_book_appointment fired. booking_id=' . (int) $booking_id);
+  // Only act on BookingPress bookings table, and only on the main booking insert
+  if (
+    strpos($table, 'bookingpress_appointment_bookings') === false ||
+    empty($data['bookingpress_appointment_booking_id'])
+  ) {
+    return;
+  }
 
-    if (!$booking_id) return;
+  $booking_id = (int) $wpdb->insert_id;
 
-    MMBPL_Sync::handle_booking_created($booking_id, $args);
-  }, 10, 3);
+  if (!$booking_id) {
+    MMBPL_Logger::log('wpdb_insert detected BookingPress booking insert but no insert_id.');
+    return;
+  }
 
-  // Booking updated
-  add_action('bookingpress_after_update_appointment', function () {
-    $args = func_get_args();
-    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+  MMBPL_Logger::log('DB INSERT detected. booking_id=' . $booking_id);
 
-    if (!$booking_id) return;
+  // Create sync on booking creation
+  MMBPL_Sync::handle_booking_created($booking_id);
 
-    MMBPL_Sync::handle_booking_updated($booking_id, $args);
-  }, 10, 10);
-
-  // Booking cancelled
-  add_action('bookingpress_after_cancel_appointment', function () {
-    $args = func_get_args();
-    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
-
-    if (!$booking_id) return;
-
-    MMBPL_Sync::handle_booking_cancelled($booking_id, $args);
-  }, 10, 10);
-});
+}, 10, 2);
 
 class MMBPL_Sync {
 
@@ -126,6 +120,7 @@ class MMBPL_Sync {
     }
   }
 
+  // These remain for later use if we add update/cancel detection via DB updates:
   public static function handle_booking_updated($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
     if (empty($settings['lacrm_api_key'])) return;
