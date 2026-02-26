@@ -19,6 +19,8 @@ require_once MMBPL_PLUGIN_DIR . 'includes/lacrm.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/bookingpress.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/admin.php';
 
+MMBPL_Logger::log('Plugin loaded');
+
 register_activation_hook(__FILE__, function () {
   MMBPL_Map::install();
 
