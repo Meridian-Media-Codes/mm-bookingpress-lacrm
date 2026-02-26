@@ -3,9 +3,25 @@ if (!defined('ABSPATH')) exit;
 
 class MMBPL_Map {
 
+  private static $cols_cache = null;
+
   private static function table_name() {
     global $wpdb;
     return $wpdb->prefix . 'mmbpl_map';
+  }
+
+  private static function cols() {
+    if (is_array(self::$cols_cache)) return self::$cols_cache;
+
+    global $wpdb;
+    $table = self::table_name();
+    $cols = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
+    self::$cols_cache = is_array($cols) ? $cols : [];
+    return self::$cols_cache;
+  }
+
+  private static function has_col($col) {
+    return in_array($col, self::cols(), true);
   }
 
   public static function install() {
@@ -16,7 +32,7 @@ class MMBPL_Map {
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
-    // Create the modern schema (dbDelta will not always rename old columns, so we also migrate below)
+    // Create if missing (legacy installs may already exist with id PK)
     $sql = "CREATE TABLE {$table} (
       booking_id BIGINT(20) UNSIGNED NOT NULL,
       event_id VARCHAR(64) NOT NULL,
@@ -28,55 +44,60 @@ class MMBPL_Map {
 
     dbDelta($sql);
 
-    // Migrate legacy schema if present (id + lacrm_event_id)
-    $cols = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
-    if (!is_array($cols) || empty($cols)) return;
+    // Refresh cache after dbDelta
+    self::$cols_cache = null;
 
-    $has_event_id = in_array('event_id', $cols, true);
-    $has_lacrm_event_id = in_array('lacrm_event_id', $cols, true);
-    $has_booking_hash = in_array('booking_hash', $cols, true);
-
-    if (!$has_event_id && $has_lacrm_event_id) {
+    // Legacy migration: lacrm_event_id -> event_id
+    if (!self::has_col('event_id') && self::has_col('lacrm_event_id')) {
       $wpdb->query("ALTER TABLE {$table} CHANGE lacrm_event_id event_id VARCHAR(64) NOT NULL");
+      self::$cols_cache = null;
     }
 
-    if (!$has_booking_hash) {
-      $wpdb->query("ALTER TABLE {$table} ADD booking_hash CHAR(64) NOT NULL DEFAULT ''");
+    // Ensure booking_hash exists
+    if (!self::has_col('booking_hash')) {
+      $wpdb->query("ALTER TABLE {$table} ADD booking_hash CHAR(64) NOT NULL DEFAULT '' AFTER event_id");
+      self::$cols_cache = null;
     }
 
-    // Ensure booking_id is unique so upserts behave
-    $indexes = $wpdb->get_results("SHOW INDEX FROM {$table}", ARRAY_A);
-    $has_unique_booking = false;
-    if (is_array($indexes)) {
-      foreach ($indexes as $idx) {
-        if (!empty($idx['Column_name']) && $idx['Column_name'] === 'booking_id' && (int) ($idx['Non_unique'] ?? 1) === 0) {
-          $has_unique_booking = true;
-          break;
-        }
-      }
-    }
-
-    if (!$has_unique_booking) {
-      // If booking_id is already PRIMARY KEY this will fail harmlessly
-      $wpdb->query("ALTER TABLE {$table} ADD UNIQUE KEY booking_id_unique (booking_id)");
-    }
+    // Ensure booking_id unique (even if table uses id PK)
+    $wpdb->query("ALTER TABLE {$table} ADD UNIQUE KEY booking_id_unique (booking_id)");
   }
 
   public static function set_mapping($booking_id, $event_id, $booking_hash = '') {
     global $wpdb;
     $table = self::table_name();
 
-    // Use INSERT .. ON DUPLICATE KEY UPDATE so it works with UNIQUE booking_id
+    $booking_id = (int) $booking_id;
+    $event_id = (string) $event_id;
+    $booking_hash = (string) $booking_hash;
+
+    $has_hash = self::has_col('booking_hash');
+
+    if ($has_hash) {
+      $wpdb->query($wpdb->prepare(
+        "INSERT INTO {$table} (booking_id, event_id, booking_hash, updated_at)
+         VALUES (%d, %s, %s, %s)
+         ON DUPLICATE KEY UPDATE
+           event_id = VALUES(event_id),
+           booking_hash = VALUES(booking_hash),
+           updated_at = VALUES(updated_at)",
+        $booking_id,
+        $event_id,
+        $booking_hash,
+        current_time('mysql')
+      ));
+      return;
+    }
+
+    // Fallback for legacy schema with no booking_hash
     $wpdb->query($wpdb->prepare(
-      "INSERT INTO {$table} (booking_id, event_id, booking_hash, updated_at)
-       VALUES (%d, %s, %s, %s)
+      "INSERT INTO {$table} (booking_id, event_id, updated_at)
+       VALUES (%d, %s, %s)
        ON DUPLICATE KEY UPDATE
          event_id = VALUES(event_id),
-         booking_hash = VALUES(booking_hash),
          updated_at = VALUES(updated_at)",
-      (int) $booking_id,
-      (string) $event_id,
-      (string) $booking_hash,
+      $booking_id,
+      $event_id,
       current_time('mysql')
     ));
   }
@@ -84,13 +105,26 @@ class MMBPL_Map {
   public static function get_mapping($booking_id) {
     global $wpdb;
     $table = self::table_name();
+    $booking_id = (int) $booking_id;
+
+    $has_hash = self::has_col('booking_hash');
+
+    if ($has_hash) {
+      $row = $wpdb->get_row(
+        $wpdb->prepare("SELECT booking_id, event_id, booking_hash FROM {$table} WHERE booking_id=%d LIMIT 1", $booking_id),
+        ARRAY_A
+      );
+      return $row ?: null;
+    }
 
     $row = $wpdb->get_row(
-      $wpdb->prepare("SELECT booking_id, event_id, booking_hash FROM {$table} WHERE booking_id=%d LIMIT 1", (int) $booking_id),
+      $wpdb->prepare("SELECT booking_id, event_id FROM {$table} WHERE booking_id=%d LIMIT 1", $booking_id),
       ARRAY_A
     );
 
-    return $row ?: null;
+    if (!$row) return null;
+    $row['booking_hash'] = '';
+    return $row;
   }
 
   public static function get_event_id($booking_id) {
