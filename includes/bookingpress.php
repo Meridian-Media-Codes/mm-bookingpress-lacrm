@@ -33,7 +33,7 @@ class MMBPL_BookingPress {
     if (!$row) return false;
 
     // Normalize output keys used by sync
-    $payload = [
+        $payload = [
       'customer_first_name' => $row['customer_first_name'] ?? '',
       'customer_last_name'  => $row['customer_last_name'] ?? '',
       'customer_email'      => $row['customer_email'] ?? '',
@@ -42,6 +42,8 @@ class MMBPL_BookingPress {
       'service_name'        => $row['service_name'] ?? '',
       'appointment_date'    => $row['appointment_date'] ?? '',
       'appointment_time'    => $row['appointment_time'] ?? '',
+      'status'              => $row['status'] ?? '',
+      'internal_note'       => $row['internal_note'] ?? '',
     ];
 
     return $payload;
