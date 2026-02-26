@@ -1,8 +1,8 @@
 <?php
 /*
 Plugin Name: MM BookingPress to LACRM
-Description: Sync BookingPress Pro bookings to Less Annoying CRM (create contact, create event, add note, delete on cancel).
-Version: 1.0.0
+Description: Sync BookingPress Pro bookings to Less Annoying CRM (create or update contact, create event, add note, delete event on cancel if mapping exists).
+Version: 1.0.1
 Author: Meridian Media
 */
 
@@ -11,7 +11,7 @@ if (!defined('ABSPATH')) exit;
 define('MMBPL_PLUGIN_FILE', __FILE__);
 define('MMBPL_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MMBPL_OPT', 'mmbpl_settings');
-define('MMBPL_DB_VERSION', '1.0');
+define('MMBPL_LAST_OPT', 'mmbpl_last_processed_id');
 
 require_once MMBPL_PLUGIN_DIR . 'includes/logger.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/map.php';
@@ -20,105 +20,129 @@ require_once MMBPL_PLUGIN_DIR . 'includes/bookingpress.php';
 require_once MMBPL_PLUGIN_DIR . 'includes/admin.php';
 
 /**
- * Activation: create mapping table + default settings.
+ * Custom cron interval (2 minutes).
  */
+add_filter('cron_schedules', function ($schedules) {
+  if (!isset($schedules['mmbpl_2min'])) {
+    $schedules['mmbpl_2min'] = [
+      'interval' => 120,
+      'display'  => 'Every 2 minutes (MMBPL)'
+    ];
+  }
+  return $schedules;
+});
+
 register_activation_hook(__FILE__, function () {
   MMBPL_Map::install();
 
   if (!get_option(MMBPL_OPT)) {
     add_option(MMBPL_OPT, [
-      'lacrm_api_key' => '',
-      'event_title_template' => '{service} booking',
-      'add_note' => 1,
-      'delete_on_cancel' => 1,
-      'debug' => 0,
-      'bp_tables' => [],
+      'lacrm_api_key'          => '',
+      'event_title_template'   => '{service} booking',
+      'add_note'               => 1,
+      'delete_on_cancel'       => 1,
+      'debug'                  => 0,
+      'bp_tables'              => [],
+      // Set this if you want to stop the first run from trying to sync ALL historical bookings.
+      'start_from_latest'      => 1,
     ]);
+  }
+
+  // Optionally start from latest booking id so it does not spam old ones
+  $settings = get_option(MMBPL_OPT, []);
+  if (!empty($settings['start_from_latest'])) {
+    $latest = MMBPL_BookingPress::get_latest_booking_id();
+    if ($latest > 0) {
+      update_option(MMBPL_LAST_OPT, (int) $latest);
+      MMBPL_Logger::log('Activation: start_from_latest enabled. Set last_processed_id=' . (int) $latest);
+    }
+  }
+
+  if (!wp_next_scheduled('mmbpl_poll_bookings')) {
+    wp_schedule_event(time() + 30, 'mmbpl_2min', 'mmbpl_poll_bookings');
   }
 });
 
-MMBPL_Logger::log('Plugin loaded');
+register_deactivation_hook(__FILE__, function () {
+  $ts = wp_next_scheduled('mmbpl_poll_bookings');
+  if ($ts) {
+    wp_unschedule_event($ts, 'mmbpl_poll_bookings');
+  }
+});
 
-/**
- * Polling fallback (works even if BookingPress hooks and wpdb hooks are unreliable).
- * Runs on normal WP requests. After a booking is created, refresh any page once to trigger sync.
- */
-add_action('init', function () {
+add_action('mmbpl_poll_bookings', function () {
+  $settings = get_option(MMBPL_OPT, []);
+  $debug = !empty($settings['debug']);
 
-  global $wpdb;
+  $table = MMBPL_BookingPress::get_booking_table_name();
+  $pk    = MMBPL_BookingPress::get_booking_pk_column($table);
 
-  // Find the actual BookingPress bookings table name (prefix can vary)
-  $table = $wpdb->get_var("SHOW TABLES LIKE '%bookingpress_appointment_bookings%'");
-
-  if (empty($table)) {
-    MMBPL_Logger::log('Polling: bookings table not found.');
+  if (!$table || !$pk) {
+    if ($debug) MMBPL_Logger::log('Poll: booking table or pk not detected. table=' . (string) $table . ' pk=' . (string) $pk);
     return;
   }
 
-  $last_processed = (int) get_option('mmbpl_last_processed_id', 0);
+  global $wpdb;
 
-  $latest_id = (int) $wpdb->get_var("SELECT MAX(bookingpress_appointment_booking_id) FROM {$table}");
+  $last_processed = (int) get_option(MMBPL_LAST_OPT, 0);
+  $latest_id = (int) $wpdb->get_var("SELECT MAX({$pk}) FROM {$table}");
 
   if (!$latest_id || $latest_id <= $last_processed) {
+    if ($debug) MMBPL_Logger::log('Poll: no new bookings. latest=' . (int) $latest_id . ' last=' . (int) $last_processed);
     return;
   }
 
   $new_ids = $wpdb->get_col(
     $wpdb->prepare(
-      "SELECT bookingpress_appointment_booking_id
-       FROM {$table}
-       WHERE bookingpress_appointment_booking_id > %d
-       ORDER BY bookingpress_appointment_booking_id ASC",
+      "SELECT {$pk} FROM {$table} WHERE {$pk} > %d ORDER BY {$pk} ASC LIMIT 25",
       $last_processed
     )
   );
 
-  if (empty($new_ids)) {
-    return;
-  }
+  if (empty($new_ids)) return;
 
   foreach ($new_ids as $booking_id) {
+    $booking_id = (int) $booking_id;
 
-    MMBPL_Logger::log('Polling detected new booking ID ' . (int) $booking_id);
+    MMBPL_Logger::log('Poll: detected new booking_id=' . $booking_id);
 
-    MMBPL_Sync::handle_booking_created((int) $booking_id);
+    MMBPL_Sync::handle_booking_created($booking_id);
 
-    update_option('mmbpl_last_processed_id', (int) $booking_id);
+    update_option(MMBPL_LAST_OPT, $booking_id);
   }
-
 });
 
 /**
- * Optional: DB insert trigger (may not fire on some setups; polling above is the reliable fallback).
+ * Optional: listen for BookingPress hooks too.
+ * If they ever fire reliably on your install, great.
+ * If not, polling still handles it.
  */
-add_action('wpdb_insert', function ($table, $data) {
+add_action('plugins_loaded', function () {
+  add_action('bookingpress_after_book_appointment', function () {
+    $args = func_get_args();
+    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+    MMBPL_Logger::log('HOOK bookingpress_after_book_appointment fired. booking_id=' . (int) $booking_id);
+    if ($booking_id) {
+      MMBPL_Sync::handle_booking_created((int) $booking_id, $args);
+      update_option(MMBPL_LAST_OPT, (int) $booking_id);
+    }
+  }, 10, 10);
 
-  global $wpdb;
-
-  if (
-    strpos($table, 'bookingpress_appointment_bookings') === false ||
-    empty($data['bookingpress_appointment_booking_id'])
-  ) {
-    return;
-  }
-
-  $booking_id = (int) $wpdb->insert_id;
-
-  if (!$booking_id) {
-    MMBPL_Logger::log('wpdb_insert detected BookingPress booking insert but no insert_id.');
-    return;
-  }
-
-  MMBPL_Logger::log('DB INSERT detected. booking_id=' . $booking_id);
-
-  MMBPL_Sync::handle_booking_created($booking_id);
-
-}, 10, 2);
+  add_action('bookingpress_after_cancel_appointment', function () {
+    $args = func_get_args();
+    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+    MMBPL_Logger::log('HOOK bookingpress_after_cancel_appointment fired. booking_id=' . (int) $booking_id);
+    if ($booking_id) {
+      MMBPL_Sync::handle_booking_cancelled((int) $booking_id, $args);
+    }
+  }, 10, 10);
+});
 
 class MMBPL_Sync {
 
   public static function handle_booking_created($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
+    $debug = !empty($settings['debug']);
 
     if (empty($settings['lacrm_api_key'])) {
       MMBPL_Logger::log('No LACRM API key set. Skipping.');
@@ -132,7 +156,7 @@ class MMBPL_Sync {
       return;
     }
 
-    if (!empty($settings['debug'])) {
+    if ($debug) {
       MMBPL_Logger::log('CREATE booking_id=' . (int) $booking_id . ' payload=' . print_r($bp, true));
     }
 
@@ -145,12 +169,23 @@ class MMBPL_Sync {
 
     $title = self::render_template($settings['event_title_template'] ?? '{service} booking', $bp);
 
+    // LACRM v2 expects DateTime strings for StartDate/EndDate
+    $start = self::make_datetime($bp['appointment_date'] ?? '', $bp['appointment_time'] ?? '');
+    $end   = self::make_datetime($bp['appointment_date'] ?? '', $bp['appointment_time'] ?? '', 60);
+
+    if (!$start || !$end) {
+      MMBPL_Logger::log('Could not build start/end datetime for booking_id=' . (int) $booking_id);
+      return;
+    }
+
     $event_id = MMBPL_LACRM::create_event([
-      'ContactId' => $contact_id,
-      'Subject'   => $title,
-      'Date'      => $bp['appointment_date'] ?? '',
-      'Time'      => $bp['appointment_time'] ?? '',
-      'Details'   => self::build_summary($bp),
+      'ContactId'    => (string) $contact_id,
+      'Name'         => $title,
+      'StartDate'    => $start,
+      'EndDate'      => $end,
+      'Description'  => self::build_summary($bp),
+      'Location'     => '',
+      'IsAllDay'     => false,
     ]);
 
     if ($event_id) {
@@ -161,7 +196,7 @@ class MMBPL_Sync {
 
     if (!empty($settings['add_note'])) {
       $ok = MMBPL_LACRM::create_note([
-        'ContactId' => $contact_id,
+        'ContactId' => (string) $contact_id,
         'Note'      => self::build_summary($bp),
       ]);
 
@@ -171,65 +206,38 @@ class MMBPL_Sync {
     }
   }
 
-  // Available for later if we implement update/cancel detection
-  public static function handle_booking_updated($booking_id, $hook_args = []) {
-    $settings = get_option(MMBPL_OPT, []);
-    if (empty($settings['lacrm_api_key'])) return;
-
-    $bp = MMBPL_BookingPress::get_booking_payload($booking_id);
-    if (!$bp || empty($bp['customer_email'])) return;
-
-    if (!empty($settings['debug'])) {
-      MMBPL_Logger::log('UPDATE booking_id=' . (int) $booking_id . ' payload=' . print_r($bp, true));
-    }
-
-    $contact_id = MMBPL_LACRM::upsert_contact_by_email($bp);
-    if (!$contact_id) return;
-
-    $existing_event_id = MMBPL_Map::get_event_id((int) $booking_id);
-    $title = self::render_template($settings['event_title_template'] ?? '{service} booking', $bp);
-
-    if ($existing_event_id) {
-      MMBPL_LACRM::delete_event($existing_event_id);
-
-      $new_event_id = MMBPL_LACRM::create_event([
-        'ContactId' => $contact_id,
-        'Subject'   => $title,
-        'Date'      => $bp['appointment_date'] ?? '',
-        'Time'      => $bp['appointment_time'] ?? '',
-        'Details'   => self::build_summary($bp),
-      ]);
-
-      if ($new_event_id) {
-        MMBPL_Map::set_event_id((int) $booking_id, (string) $new_event_id);
-      } else {
-        MMBPL_Logger::log('Recreate event failed for booking_id=' . (int) $booking_id);
-      }
-    } else {
-      self::handle_booking_created($booking_id, $hook_args);
-    }
-  }
-
   public static function handle_booking_cancelled($booking_id, $hook_args = []) {
     $settings = get_option(MMBPL_OPT, []);
     if (empty($settings['lacrm_api_key'])) return;
     if (empty($settings['delete_on_cancel'])) return;
 
     $event_id = MMBPL_Map::get_event_id((int) $booking_id);
-
-    if (!empty($settings['debug'])) {
-      MMBPL_Logger::log('CANCEL booking_id=' . (int) $booking_id . ' event_id=' . ($event_id ?: 'none'));
-    }
-
     if (!$event_id) return;
 
-    $ok = MMBPL_LACRM::delete_event($event_id);
+    $ok = MMBPL_LACRM::delete_event((string) $event_id);
 
     if ($ok) {
       MMBPL_Map::delete_mapping((int) $booking_id);
     } else {
-      MMBPL_Logger::log('DeleteEvent failed for booking_id=' . (int) $booking_id . ' event_id=' . $event_id);
+      MMBPL_Logger::log('DeleteEvent failed for booking_id=' . (int) $booking_id . ' event_id=' . (string) $event_id);
     }
+  }
+
+  private static function make_datetime($date, $time, $add_minutes = 0) {
+    $date = trim((string) $date);
+    $time = trim((string) $time);
+
+    if (!$date) return '';
+
+    if (!$time) $time = '00:00:00';
+
+    $dt = strtotime($date . ' ' . $time);
+    if (!$dt) return '';
+
+    if ($add_minutes > 0) $dt += ($add_minutes * 60);
+
+    // LACRM accepts ISO8601 DateTime strings. We will send UTC.
+    return gmdate('Y-m-d\TH:i:s\Z', $dt);
   }
 
   private static function build_summary($bp) {
@@ -266,6 +274,6 @@ class MMBPL_Sync {
       '{name}'    => trim(($bp['customer_first_name'] ?? '') . ' ' . ($bp['customer_last_name'] ?? '')),
     ];
 
-    return trim(strtr($tpl, $replacements));
+    return trim(strtr((string) $tpl, $replacements));
   }
 }
