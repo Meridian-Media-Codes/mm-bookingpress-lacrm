@@ -174,6 +174,8 @@ $out = [
   'customer_email'       => (string) ($booking['bookingpress_customer_email'] ?? ($booking['customer_email'] ?? '')),
   'customer_phone'       => (string) ($booking['bookingpress_customer_phone'] ?? ($booking['customer_phone'] ?? '')),
   'customer_note'        => (string) ($booking['bookingpress_customer_note'] ?? ($booking['customer_note'] ?? '')),
+  'status'               => (string) ($booking['bookingpress_appointment_status'] ?? ($booking['appointment_status'] ?? '')),
+  'internal_note'        => (string) ($booking['bookingpress_appointment_internal_note'] ?? ($booking['appointment_internal_note'] ?? '')),
 ];
 
 if ($debug) {
