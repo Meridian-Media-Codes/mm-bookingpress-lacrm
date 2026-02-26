@@ -47,6 +47,41 @@ class MMBPL_BookingPress {
     return $payload;
   }
 
+  public static function resolve_booking_id($maybe_id) {
+  global $wpdb;
+
+  $maybe_id = (int) $maybe_id;
+  if ($maybe_id <= 0) return 0;
+
+  $table = $wpdb->get_var("SHOW TABLES LIKE '%bookingpress_appointment_bookings%'");
+  if (!$table) return $maybe_id;
+
+  // If it exists as the booking PK, use it
+  $pk = 'bookingpress_appointment_booking_id';
+  $exists = (int) $wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(1) FROM {$table} WHERE {$pk}=%d",
+    $maybe_id
+  ));
+  if ($exists > 0) return $maybe_id;
+
+  // Otherwise, try common appointment id columns and map back to booking PK
+  $cols = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
+  $colset = $cols ? array_flip($cols) : [];
+
+  foreach (['bookingpress_appointment_id', 'appointment_id'] as $c) {
+    if (!isset($colset[$c])) continue;
+
+    $bid = (int) $wpdb->get_var($wpdb->prepare(
+      "SELECT {$pk} FROM {$table} WHERE {$c}=%d LIMIT 1",
+      $maybe_id
+    ));
+    if ($bid > 0) return $bid;
+  }
+
+  // Fall back to original value if we cannot resolve
+  return $maybe_id;
+}
+
   private static function discover_tables($force = false) {
     global $wpdb;
 

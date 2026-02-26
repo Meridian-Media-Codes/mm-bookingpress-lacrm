@@ -89,28 +89,32 @@ add_action('plugins_loaded', function () {
     }
   }, 10, 10);
 
-  // Status changed (this is the reliable one to catch admin status changes)
   add_action('bookingpress_after_change_appointment_status', function ($appointment_id = null, $new_status = null) {
-    $args = func_get_args();
-    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
 
-    $settings = get_option(MMBPL_OPT, []);
-    $debug = !empty($settings['debug']);
+  $settings = get_option(MMBPL_OPT, []);
+  $debug = !empty($settings['debug']);
 
-    if ($debug) {
-      MMBPL_Logger::log('HOOK bookingpress_after_change_appointment_status fired. booking_id=' . (int) $booking_id . ' new_status=' . (string) $new_status);
-    }
+  $raw_id = is_numeric($appointment_id) ? (int) $appointment_id : 0;
+  $booking_id = MMBPL_BookingPress::resolve_booking_id($raw_id);
 
-    if (!$booking_id) return;
+  if ($debug) {
+    MMBPL_Logger::log(
+      'HOOK bookingpress_after_change_appointment_status fired. raw_id=' . (int) $raw_id .
+      ' resolved_booking_id=' . (int) $booking_id .
+      ' new_status=' . (string) $new_status
+    );
+  }
 
-    if (MMBPL_Sync::is_cancelled_status($new_status)) {
-      MMBPL_Sync::handle_booking_cancelled((int) $booking_id, $args);
-      return;
-    }
+  if (!$booking_id) return;
 
-    // For other status changes, treat as an update
-    MMBPL_Sync::handle_booking_updated((int) $booking_id, $args);
-  }, 10, 2);
+  if (MMBPL_Sync::is_cancelled_status($new_status)) {
+    MMBPL_Sync::handle_booking_cancelled((int) $booking_id, [$appointment_id, $new_status]);
+    return;
+  }
+
+  MMBPL_Sync::handle_booking_updated((int) $booking_id, [$appointment_id, $new_status]);
+
+}, 10, 2);
 
   // Cancelled (may not fire on all installs, keep for coverage)
   add_action('bookingpress_after_cancel_appointment', function () {
@@ -366,6 +370,11 @@ class MMBPL_Sync {
       if ($event_id) {
         MMBPL_Logger::log('Cancel: processing booking_id=' . $booking_id . ' event_id=' . $event_id);
       }
+
+      if (!$event_id) {
+  MMBPL_Logger::log('Cancel: no mapping found for booking_id=' . $booking_id . ' (nothing to delete)');
+  return;
+}
 
       if (!$event_id) return;
 
