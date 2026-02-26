@@ -52,7 +52,6 @@ class MMBPL_LACRM {
       MMBPL_Logger::log('LACRM call ' . $function . ' HTTP ' . $code . ' body=' . $raw);
     }
 
-    // LACRM v2 returns HTTP 400 for errors with ErrorCode / ErrorDescription in body
     if ($code === 400) {
       $err_code = is_array($json) ? ($json['ErrorCode'] ?? '') : '';
       $err_desc = is_array($json) ? ($json['ErrorDescription'] ?? '') : '';
@@ -60,25 +59,59 @@ class MMBPL_LACRM {
       return false;
     }
 
-    // Other non-200 codes
     if ($code < 200 || $code >= 300) {
       MMBPL_Logger::log('LACRM unexpected HTTP ' . $code . ' body=' . $raw);
       return false;
     }
 
     if (!is_array($json)) {
-      // Some calls return empty response on success, but most return JSON objects.
       return [];
     }
 
     return $json;
   }
 
+  private static function call_api_with_error_details($function, $parameters = []) {
+    $api_key = self::api_key();
+    if (!$api_key) return ['ok' => false, 'code' => 0, 'json' => null, 'raw' => ''];
+
+    $url = 'https://api.lessannoyingcrm.com/v2/';
+
+    $body = [
+      'Function'    => (string) $function,
+      'Parameters'  => (array) $parameters,
+    ];
+
+    $args = [
+      'timeout' => 20,
+      'headers' => [
+        'Content-Type'  => 'application/json',
+        'Authorization' => $api_key,
+      ],
+      'body' => wp_json_encode($body),
+    ];
+
+    $resp = wp_remote_post($url, $args);
+
+    if (is_wp_error($resp)) {
+      return ['ok' => false, 'code' => 0, 'json' => null, 'raw' => $resp->get_error_message()];
+    }
+
+    $code = (int) wp_remote_retrieve_response_code($resp);
+    $raw  = (string) wp_remote_retrieve_body($resp);
+
+    $json = null;
+    if ($raw !== '') $json = json_decode($raw, true);
+
+    $ok = ($code >= 200 && $code < 300);
+
+    return ['ok' => $ok, 'code' => $code, 'json' => $json, 'raw' => $raw];
+  }
+
   public static function upsert_contact_by_email($bp) {
     $email = trim((string) ($bp['customer_email'] ?? ''));
     if (!$email) return false;
 
-    // Find existing contact via GetContacts SearchTerms (email)
     $search = self::call_api('GetContacts', [
       'SearchTerms' => $email
     ]);
@@ -87,7 +120,6 @@ class MMBPL_LACRM {
 
     if (is_array($search) && !empty($search['Results']) && is_array($search['Results'])) {
       foreach ($search['Results'] as $c) {
-        // API returns Email as an array; the first item usually holds the primary email as Text
         $existing = '';
         if (!empty($c['Email']) && is_array($c['Email']) && !empty($c['Email'][0])) {
           $existing = (string) ($c['Email'][0]['Text'] ?? $c['Email'][0]['Email'] ?? '');
@@ -106,7 +138,6 @@ class MMBPL_LACRM {
     $phone = trim((string) ($bp['customer_phone'] ?? ''));
 
     if ($contact_id) {
-      // EditContact: only pass fields you want to update
       $edit_params = [
         'ContactId' => $contact_id,
       ];
@@ -115,7 +146,6 @@ class MMBPL_LACRM {
         $edit_params['Name'] = $name;
       }
 
-      // Email and Phone are arrays, like CreateContact uses
       $edit_params['Email'] = [
         ['Email' => $email, 'Type' => 'Work']
       ];
@@ -132,7 +162,6 @@ class MMBPL_LACRM {
       return $contact_id;
     }
 
-    // CreateContact needs AssignedTo. Get your user first.
     $user = self::call_api('GetUser', []);
     if (!$user || empty($user['UserId'])) {
       MMBPL_Logger::log('LACRM GetUser failed, cannot create contact.');
@@ -168,7 +197,6 @@ class MMBPL_LACRM {
       return false;
     }
 
-    // CreateEvent supports Attendees list. To link a contact, add them as an attendee with IsUser=false.
     $resp = self::call_api('CreateEvent', [
       'Name'        => $name,
       'StartDate'   => $start,
@@ -194,12 +222,37 @@ class MMBPL_LACRM {
     $event_id = (string) $event_id;
     if (!$event_id) return false;
 
-    $resp = self::call_api('DeleteEvent', [
+    $resp = self::call_api_with_error_details('DeleteEvent', [
       'EventId' => $event_id
     ]);
 
-    // DeleteEvent returns nothing on success, so any non-false is ok.
-    return ($resp !== false);
+    if (!empty($resp['ok'])) {
+      return true;
+    }
+
+    // Idempotency: treat "not found" style errors as success
+    $raw = strtolower((string) ($resp['raw'] ?? ''));
+    $err_desc = '';
+    $err_code = '';
+
+    if (is_array($resp['json'])) {
+      $err_desc = strtolower((string) ($resp['json']['ErrorDescription'] ?? ''));
+      $err_code = strtolower((string) ($resp['json']['ErrorCode'] ?? ''));
+    }
+
+    $haystack = $raw . ' ' . $err_desc . ' ' . $err_code;
+
+    if (
+      strpos($haystack, 'not found') !== false ||
+      strpos($haystack, 'does not exist') !== false ||
+      strpos($haystack, 'no such') !== false
+    ) {
+      MMBPL_Logger::log('LACRM DeleteEvent: event already absent, treating as success. event_id=' . $event_id);
+      return true;
+    }
+
+    MMBPL_Logger::log('LACRM DeleteEvent failed. event_id=' . $event_id . ' http=' . (int) ($resp['code'] ?? 0) . ' body=' . (string) ($resp['raw'] ?? ''));
+    return false;
   }
 
   public static function create_note($note) {

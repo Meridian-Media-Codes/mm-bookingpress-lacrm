@@ -2,7 +2,7 @@
 /*
 Plugin Name: MM BookingPress to LACRM
 Description: Sync BookingPress Pro bookings to Less Annoying CRM (create/update contact, create event, add note, delete on cancel, resync on update).
-Version: 1.0.4
+Version: 1.0.5
 Author: Meridian Media
 */
 
@@ -89,7 +89,30 @@ add_action('plugins_loaded', function () {
     }
   }, 10, 10);
 
-  // Cancelled (may not fire on your install, but keep it anyway)
+  // Status changed (this is the reliable one to catch admin status changes)
+  add_action('bookingpress_after_change_appointment_status', function ($appointment_id = null, $new_status = null) {
+    $args = func_get_args();
+    $booking_id = MMBPL_BookingPress::extract_booking_id($args);
+
+    $settings = get_option(MMBPL_OPT, []);
+    $debug = !empty($settings['debug']);
+
+    if ($debug) {
+      MMBPL_Logger::log('HOOK bookingpress_after_change_appointment_status fired. booking_id=' . (int) $booking_id . ' new_status=' . (string) $new_status);
+    }
+
+    if (!$booking_id) return;
+
+    if (MMBPL_Sync::is_cancelled_status($new_status)) {
+      MMBPL_Sync::handle_booking_cancelled((int) $booking_id, $args);
+      return;
+    }
+
+    // For other status changes, treat as an update
+    MMBPL_Sync::handle_booking_updated((int) $booking_id, $args);
+  }, 10, 2);
+
+  // Cancelled (may not fire on all installs, keep for coverage)
   add_action('bookingpress_after_cancel_appointment', function () {
     $args = func_get_args();
     $booking_id = MMBPL_BookingPress::extract_booking_id($args);
@@ -107,7 +130,7 @@ add_action('plugins_loaded', function () {
 
 /**
  * Poller: detects new bookings (by id), cancellations (by status), and changes (by hash).
- * This solves installs where BookingPress does not fire cancel hooks.
+ * Fallback for installs where BookingPress hooks do not fire reliably.
  */
 add_action(MMBPL_CRON_HOOK, function () {
 
@@ -153,17 +176,24 @@ add_action(MMBPL_CRON_HOOK, function () {
   foreach ($mapped_booking_ids as $bid) {
     $bid = (int) $bid;
 
-    $bp = MMBPL_BookingPress::get_booking_payload($bid);
-    if (!$bp) continue;
+    // Cancellation detection that does NOT rely on discover_tables()
+    $status = $wpdb->get_var(
+      $wpdb->prepare(
+        "SELECT bookingpress_appointment_status FROM {$table} WHERE {$pk}=%d LIMIT 1",
+        $bid
+      )
+    );
 
-    // Cancel detection by status
-    if (MMBPL_Sync::is_cancelled_status($bp['status'] ?? '')) {
-      if ($debug) MMBPL_Logger::log('Poll: booking cancelled in DB booking_id=' . $bid . ' status=' . (string) ($bp['status'] ?? ''));
+    if (MMBPL_Sync::is_cancelled_status($status)) {
+      MMBPL_Logger::log('Poll: cancellation detected booking_id=' . $bid . ' status=' . (string) $status);
       MMBPL_Sync::handle_booking_cancelled($bid);
       continue;
     }
 
-    // Change detection by hash
+    // Only fetch the full payload if not cancelled
+    $bp = MMBPL_BookingPress::get_booking_payload($bid);
+    if (!$bp) continue;
+
     $map = MMBPL_Map::get_mapping($bid);
     if (!$map) continue;
 
@@ -210,7 +240,7 @@ class MMBPL_Sync {
       $current_hash = self::booking_hash($bp);
 
       // Idempotency: already synced and unchanged
-      if ($existing && !empty($existing['lacrm_event_id']) && !empty($existing['booking_hash'])) {
+      if ($existing && !empty($existing['event_id']) && !empty($existing['booking_hash'])) {
         if (hash_equals((string) $existing['booking_hash'], (string) $current_hash)) {
           if ($debug) MMBPL_Logger::log('Create: already synced booking_id=' . $booking_id);
           return;
@@ -218,7 +248,7 @@ class MMBPL_Sync {
       }
 
       // If mapped but changed, update flow
-      if ($existing && !empty($existing['lacrm_event_id'])) {
+      if ($existing && !empty($existing['event_id'])) {
         self::handle_booking_updated($booking_id, $hook_args);
         return;
       }
@@ -326,24 +356,29 @@ class MMBPL_Sync {
 
     try {
       $settings = get_option(MMBPL_OPT, []);
-      $debug = !empty($settings['debug']);
 
       if (empty($settings['lacrm_api_key'])) return;
       if (empty($settings['delete_on_cancel'])) return;
 
       $event_id = MMBPL_Map::get_event_id($booking_id);
 
-      if ($debug) {
-        MMBPL_Logger::log('Cancel: booking_id=' . $booking_id . ' mapped_event_id=' . ($event_id ?: 'none'));
+      // Always log cancellation actions that have a mapping, even if debug is off
+      if ($event_id) {
+        MMBPL_Logger::log('Cancel: processing booking_id=' . $booking_id . ' event_id=' . $event_id);
       }
 
       if (!$event_id) return;
 
       $ok = MMBPL_LACRM::delete_event((string) $event_id);
+
       if ($ok) {
         MMBPL_Map::delete_mapping($booking_id);
-        if ($debug) MMBPL_Logger::log('Cancel: deleted and unmapped booking_id=' . $booking_id);
+        MMBPL_Logger::log('Cancel: deleted and unmapped booking_id=' . $booking_id . ' event_id=' . $event_id);
+        return;
       }
+
+      // If delete failed, do not remove mapping
+      MMBPL_Logger::log('Cancel: delete failed booking_id=' . $booking_id . ' event_id=' . $event_id);
 
     } finally {
       self::release_lock($booking_id);
@@ -354,14 +389,13 @@ class MMBPL_Sync {
     $raw = trim((string) $status);
     if ($raw === '') return false;
 
-    // Your DB shows bookingpress_appointment_status and cancelled looked like 3
     if (ctype_digit($raw)) {
       $code = (int) $raw;
       return in_array($code, [3, 4], true);
     }
 
     $s = strtolower($raw);
-    return in_array($s, ['cancelled','canceled','cancel','rejected'], true);
+    return in_array($s, ['cancelled', 'canceled', 'cancel', 'rejected'], true);
   }
 
   public static function booking_hash($bp) {
