@@ -4,9 +4,12 @@ if (!defined('ABSPATH')) exit;
 class MMBPL_BookingPress {
 
   // Your two custom fields
-  // Field IDs are shown in your form_fields table but we do not need them for lookup.
+  const FIELD_ID_ADDRESS1 = 9;
+  const FIELD_ID_POSTCODE = 10;
+
+  // Meta keys shown in your BookingPress UI
   const METAKEY_ADDRESS1  = 'text_9Vv7N';
-  const METAKEY_POSTCODE  = 'text_SIzYG'; // note: capital i, matches your screenshot
+  const METAKEY_POSTCODE  = 'text_SlzYG';
 
   public static function extract_booking_id($args) {
     foreach ($args as $a) {
@@ -33,7 +36,7 @@ class MMBPL_BookingPress {
     ));
     if ($exists > 0) return $maybe_id;
 
-    // Otherwise, try appointment id columns and map back to booking PK
+    // Otherwise try mapping from appointment id columns back to booking PK
     $cols = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
     $colset = $cols ? array_flip($cols) : [];
 
@@ -83,7 +86,7 @@ class MMBPL_BookingPress {
       'status'              => $row['status'] ?? '',
       'internal_note'       => $row['internal_note'] ?? '',
 
-      // Address fields
+      // Address fields (we will hydrate these)
       'customer_address_1'  => $row['customer_address_1'] ?? '',
       'customer_address_2'  => $row['customer_address_2'] ?? '',
       'customer_city'       => $row['customer_city'] ?? '',
@@ -98,7 +101,7 @@ class MMBPL_BookingPress {
       '_entry_id'           => (int) ($row['_entry_id'] ?? 0),
     ];
 
-    self::hydrate_address_from_appointment_meta($payload);
+    self::hydrate_custom_address_from_anywhere($payload);
 
     return $payload;
   }
@@ -110,9 +113,9 @@ class MMBPL_BookingPress {
     $raw = $wpdb->get_col($wpdb->prepare("SHOW TABLES LIKE %s", $like));
 
     $tables = [
-      'booking_table' => '',
+      'booking_table'  => '',
       'customer_table' => '',
-      'service_table' => '',
+      'service_table'  => '',
     ];
 
     if (empty($raw)) return $tables;
@@ -212,7 +215,7 @@ class MMBPL_BookingPress {
       'status'               => (string) ($booking['bookingpress_appointment_status'] ?? ($booking['appointment_status'] ?? '')),
       'internal_note'        => (string) ($booking['bookingpress_appointment_internal_note'] ?? ($booking['appointment_internal_note'] ?? '')),
 
-      // Address defaults
+      // Defaults (these are hydrated later)
       'customer_address_1'   => '',
       'customer_address_2'   => '',
       'customer_city'        => '',
@@ -220,7 +223,7 @@ class MMBPL_BookingPress {
       'customer_postcode'    => '',
       'customer_country'     => (string) ($booking['bookingpress_customer_country'] ?? ($booking['customer_country'] ?? ($booking['country'] ?? ''))),
 
-      // Ids for lookup
+      // Ids for meta lookup
       '_booking_id'          => (int) ($booking['bookingpress_appointment_booking_id'] ?? $booking_id),
       '_appointment_id'      => (int) ($booking['bookingpress_appointment_id'] ?? ($booking['appointment_id'] ?? 0)),
       '_customer_id'         => (int) ($booking['bookingpress_customer_id'] ?? ($booking['customer_id'] ?? 0)),
@@ -232,67 +235,300 @@ class MMBPL_BookingPress {
       MMBPL_Logger::log('Booking ids: booking_id=' . (int) $out['_booking_id'] . ' appointment_id=' . (int) $out['_appointment_id'] . ' customer_id=' . (int) $out['_customer_id'] . ' entry_id=' . (int) $out['_entry_id']);
     }
 
+    // Scan blob columns too
+    self::hydrate_from_row_blobs($out, $booking);
+
     return $out;
   }
 
-  private static function get_appointment_meta_table() {
-    global $wpdb;
-    $t = $wpdb->get_var("SHOW TABLES LIKE '%bookingpress_appointment_meta%'");
-    return $t ? $t : '';
+  private static function hydrate_custom_address_from_anywhere(&$payload) {
+    $needs_addr = (trim((string) ($payload['customer_address_1'] ?? '')) === '');
+    $needs_post = (trim((string) ($payload['customer_postcode'] ?? '')) === '');
+
+    if (!$needs_addr && !$needs_post) return;
+
+    // Your DB shows appointment_meta has bookingpress_entry_id and bookingpress_appointment_id
+    self::hydrate_from_meta_table(
+      $payload,
+      'bookingpress_appointment_meta',
+      'bookingpress_entry_id',
+      (int) ($payload['_entry_id'] ?? 0)
+    );
+
+    self::hydrate_from_meta_table(
+      $payload,
+      'bookingpress_appointment_meta',
+      'bookingpress_appointment_id',
+      (int) ($payload['_appointment_id'] ?? 0)
+    );
+
+    // Customers meta table exists but does not store address in your screenshots, still safe to scan
+    self::hydrate_from_meta_table(
+      $payload,
+      'bookingpress_customers_meta',
+      'bookingpress_customer_id',
+      (int) ($payload['_customer_id'] ?? 0)
+    );
+
+    $settings = get_option(MMBPL_OPT, []);
+    if (!empty($settings['debug'])) {
+      MMBPL_Logger::log(
+        'After hydrate address_1=' . (string) ($payload['customer_address_1'] ?? '') .
+        ' postcode=' . (string) ($payload['customer_postcode'] ?? '') .
+        ' country=' . (string) ($payload['customer_country'] ?? '')
+      );
+    }
   }
 
-  private static function hydrate_address_from_appointment_meta(&$payload) {
-    $settings = get_option(MMBPL_OPT, []);
-    $debug = !empty($settings['debug']);
+  private static function hydrate_from_meta_table(&$payload, $table_suffix, $owner_col, $owner_id) {
+    global $wpdb;
 
-    $entry_id = (int) ($payload['_entry_id'] ?? 0);
-    if ($entry_id <= 0) {
-      if ($debug) MMBPL_Logger::log('Address hydrate: no entry_id on payload.');
-      return;
+    $owner_id = (int) $owner_id;
+    if ($owner_id <= 0) return;
+
+    $table = $wpdb->prefix . $table_suffix;
+    $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+    if (!$exists) return;
+
+    $cols = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
+    if (!$cols) return;
+    $colset = array_flip($cols);
+
+    if (!isset($colset[$owner_col])) return;
+
+    $key_col = null;
+    $val_col = null;
+
+    foreach ([
+      'bookingpress_entry_meta_key',
+      'bookingpress_appointment_meta_key',
+      'bookingpress_customersmeta_key',
+      'meta_key',
+      'bookingpress_meta_key'
+    ] as $c) {
+      if (isset($colset[$c])) { $key_col = $c; break; }
     }
 
-    $table = self::get_appointment_meta_table();
-    if (!$table) {
-      if ($debug) MMBPL_Logger::log('Address hydrate: bookingpress_appointment_meta table not found.');
-      return;
+    foreach ([
+      'bookingpress_entry_meta_value',
+      'bookingpress_appointment_meta_value',
+      'bookingpress_customersmeta_value',
+      'meta_value',
+      'bookingpress_meta_value'
+    ] as $c) {
+      if (isset($colset[$c])) { $val_col = $c; break; }
     }
 
-    $json = $GLOBALS['wpdb']->get_var($GLOBALS['wpdb']->prepare(
-      "SELECT bookingpress_appointment_meta_value
+    if (!$key_col || !$val_col) return;
+
+    $rows = $wpdb->get_results($wpdb->prepare(
+      "SELECT {$key_col} AS k, {$val_col} AS v
        FROM {$table}
-       WHERE bookingpress_entry_id=%d
-         AND bookingpress_appointment_meta_key=%s
-       LIMIT 1",
-      $entry_id,
-      'appointment_form_fields_data'
-    ));
+       WHERE {$owner_col} = %d",
+      $owner_id
+    ), ARRAY_A);
 
-    if (!$json) {
-      if ($debug) MMBPL_Logger::log('Address hydrate: no appointment_form_fields_data found for entry_id=' . $entry_id);
-      return;
+    if (!$rows) return;
+
+    $kv = [];
+    foreach ($rows as $r) {
+      $k = isset($r['k']) ? (string) $r['k'] : '';
+      if ($k === '') continue;
+      $kv[$k] = isset($r['v']) ? (string) $r['v'] : '';
     }
 
-    $data = json_decode((string) $json, true);
-    if (!is_array($data)) {
-      if ($debug) MMBPL_Logger::log('Address hydrate: appointment_form_fields_data was not valid JSON. entry_id=' . $entry_id);
-      return;
+    self::apply_custom_field_candidates($payload, $kv);
+
+    // Scan any blobs
+    foreach ($kv as $v) {
+      if (!is_string($v) || $v === '') continue;
+      self::apply_from_blob_string($payload, $v);
+    }
+  }
+
+  private static function apply_custom_field_candidates(&$payload, array $kv) {
+    $addr_candidates = self::candidate_keys(self::METAKEY_ADDRESS1, self::FIELD_ID_ADDRESS1);
+    $post_candidates = self::candidate_keys(self::METAKEY_POSTCODE, self::FIELD_ID_POSTCODE);
+
+    if (trim((string) ($payload['customer_address_1'] ?? '')) === '') {
+      foreach ($addr_candidates as $k) {
+        if (isset($kv[$k]) && trim((string) $kv[$k]) !== '') {
+          $payload['customer_address_1'] = trim((string) $kv[$k]);
+          break;
+        }
+      }
     }
 
-    $ff = $data['form_fields'] ?? [];
-    if (!is_array($ff)) $ff = [];
-
-    $addr1 = isset($ff[self::METAKEY_ADDRESS1]) ? trim((string) $ff[self::METAKEY_ADDRESS1]) : '';
-    $post  = isset($ff[self::METAKEY_POSTCODE]) ? trim((string) $ff[self::METAKEY_POSTCODE]) : '';
-
-    if ($addr1 !== '' && trim((string) ($payload['customer_address_1'] ?? '')) === '') {
-      $payload['customer_address_1'] = $addr1;
+    if (trim((string) ($payload['customer_postcode'] ?? '')) === '') {
+      foreach ($post_candidates as $k) {
+        if (isset($kv[$k]) && trim((string) $kv[$k]) !== '') {
+          $payload['customer_postcode'] = trim((string) $kv[$k]);
+          break;
+        }
+      }
     }
-    if ($post !== '' && trim((string) ($payload['customer_postcode'] ?? '')) === '') {
-      $payload['customer_postcode'] = $post;
+  }
+
+  private static function hydrate_from_row_blobs(&$out, array $row) {
+    foreach ($row as $v) {
+      if (!is_string($v) || $v === '') continue;
+      self::apply_from_blob_string($out, $v);
+    }
+  }
+
+  private static function apply_from_blob_string(&$payload, $blob) {
+    $blob = (string) $blob;
+
+    // JSON attempt
+    $trim = ltrim($blob);
+    if ($trim !== '' && ($trim[0] === '{' || $trim[0] === '[')) {
+      $json = json_decode($blob, true);
+      if (is_array($json)) {
+
+        // BookingPress stores custom form fields inside something like:
+        // {"form_fields":{...}} or {"form_fields":{"text_XXXXX":"value"}}
+        $form_fields = null;
+
+        if (isset($json['form_fields']) && is_array($json['form_fields'])) {
+          $form_fields = $json['form_fields'];
+        } elseif (isset($json['form_fields_data']['form_fields']) && is_array($json['form_fields_data']['form_fields'])) {
+          $form_fields = $json['form_fields_data']['form_fields'];
+        } elseif (isset($json['appointment_form_fields_data']['form_fields']) && is_array($json['appointment_form_fields_data']['form_fields'])) {
+          $form_fields = $json['appointment_form_fields_data']['form_fields'];
+        }
+
+        if (is_array($form_fields)) {
+          // Address
+          if (trim((string) ($payload['customer_address_1'] ?? '')) === '') {
+            $addr = self::find_value_case_insensitive($form_fields, self::candidate_keys(self::METAKEY_ADDRESS1, self::FIELD_ID_ADDRESS1));
+            if ($addr !== '') $payload['customer_address_1'] = $addr;
+          }
+
+          // Postcode
+          if (trim((string) ($payload['customer_postcode'] ?? '')) === '') {
+            $post = self::find_value_case_insensitive($form_fields, self::candidate_keys(self::METAKEY_POSTCODE, self::FIELD_ID_POSTCODE));
+            if ($post === '') {
+              $post = self::find_postcode_fallback($form_fields);
+            }
+            if ($post !== '') $payload['customer_postcode'] = $post;
+          }
+        }
+      }
     }
 
-    if ($debug) {
-      MMBPL_Logger::log('Address hydrate: entry_id=' . $entry_id . ' address_1=' . (string) ($payload['customer_address_1'] ?? '') . ' postcode=' . (string) ($payload['customer_postcode'] ?? ''));
+    // Regex fallback for non JSON blobs
+    if (trim((string) ($payload['customer_address_1'] ?? '')) === '') {
+      $val = self::extract_value_from_blob($blob, self::METAKEY_ADDRESS1);
+      if ($val === '') $val = self::extract_value_from_blob($blob, (string) self::FIELD_ID_ADDRESS1);
+      if ($val !== '') $payload['customer_address_1'] = $val;
     }
+
+    if (trim((string) ($payload['customer_postcode'] ?? '')) === '') {
+      $val = self::extract_value_from_blob($blob, self::METAKEY_POSTCODE);
+      if ($val === '') $val = self::extract_value_from_blob($blob, (string) self::FIELD_ID_POSTCODE);
+      if ($val === '') {
+        // Last ditch, scan blob for a postcode shaped value
+        $val = self::extract_uk_postcode_from_text($blob);
+      }
+      if ($val !== '') $payload['customer_postcode'] = $val;
+    }
+  }
+
+  private static function candidate_keys($meta_key, $field_id) {
+    $meta_key = (string) $meta_key;
+    $field_id = (int) $field_id;
+    $id = (string) $field_id;
+
+    return array_values(array_unique([
+      $meta_key,
+      $id,
+      'field_' . $meta_key,
+      'field_' . $id,
+      'form_field_' . $id,
+      'bookingpress_' . $meta_key,
+      'bookingpress_' . $id,
+      'custom_' . $meta_key,
+      'custom_' . $id,
+    ]));
+  }
+
+  private static function find_value_case_insensitive(array $data, array $candidates) {
+    // direct key match
+    foreach ($candidates as $k) {
+      if (isset($data[$k]) && is_string($data[$k]) && trim($data[$k]) !== '') {
+        return trim((string) $data[$k]);
+      }
+    }
+
+    // case insensitive match
+    $lower_map = [];
+    foreach ($data as $k => $v) {
+      $lower_map[strtolower((string) $k)] = $v;
+    }
+
+    foreach ($candidates as $k) {
+      $lk = strtolower((string) $k);
+      if (isset($lower_map[$lk]) && is_string($lower_map[$lk]) && trim($lower_map[$lk]) !== '') {
+        return trim((string) $lower_map[$lk]);
+      }
+    }
+
+    return '';
+  }
+
+  private static function find_postcode_fallback(array $form_fields) {
+    // First pass: keys that look postcode-ish
+    foreach ($form_fields as $k => $v) {
+      if (!is_string($v)) continue;
+      $val = trim($v);
+      if ($val === '') continue;
+
+      $kk = strtolower((string) $k);
+      if (strpos($kk, 'post') !== false || strpos($kk, 'zip') !== false) {
+        $pc = self::extract_uk_postcode_from_text($val);
+        if ($pc !== '') return $pc;
+      }
+    }
+
+    // Second pass: any value that looks like a UK postcode
+    foreach ($form_fields as $v) {
+      if (!is_string($v)) continue;
+      $pc = self::extract_uk_postcode_from_text($v);
+      if ($pc !== '') return $pc;
+    }
+
+    return '';
+  }
+
+  private static function extract_uk_postcode_from_text($text) {
+    $text = strtoupper(trim((string) $text));
+    if ($text === '') return '';
+
+    // Simple UK postcode matcher
+    if (preg_match('/\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/', $text, $m)) {
+      // normalize single space
+      $pc = preg_replace('/\s+/', '', $m[1]);
+      return substr($pc, 0, -3) . ' ' . substr($pc, -3);
+    }
+
+    return '';
+  }
+
+  private static function extract_value_from_blob($blob, $key) {
+    $blob = (string) $blob;
+    $key  = (string) $key;
+    if ($blob === '' || $key === '') return '';
+
+    $quoted = preg_quote($key, '/');
+
+    if (preg_match('/"' . $quoted . '"\s*:\s*"([^"]*)"/', $blob, $m)) {
+      return trim(stripslashes($m[1]));
+    }
+
+    if (preg_match('/' . $quoted . '\s*=\s*([^\s&"]+)/', $blob, $m)) {
+      return trim((string) $m[1]);
+    }
+
+    return '';
   }
 }
